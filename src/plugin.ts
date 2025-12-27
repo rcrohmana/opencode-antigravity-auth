@@ -1,5 +1,5 @@
 import { exec } from "node:child_process";
-import { ANTIGRAVITY_ENDPOINT_FALLBACKS, ANTIGRAVITY_PROVIDER_ID } from "./constants";
+import { ANTIGRAVITY_ENDPOINT_FALLBACKS, ANTIGRAVITY_PROVIDER_ID, type HeaderStyle } from "./constants";
 import { authorizeAntigravity, exchangeAntigravity } from "./antigravity/oauth";
 import type { AntigravityTokenExchangeResult } from "./antigravity/oauth";
 import { accessTokenExpired, isOAuthAuth, parseRefreshParts } from "./plugin/auth";
@@ -15,6 +15,7 @@ import {
   logModelFamily,
   isDebugEnabled,
   getLogFilePath,
+  initializeDebug,
 } from "./plugin/debug";
 import {
   buildThinkingWarmupBody,
@@ -22,11 +23,20 @@ import {
   prepareAntigravityRequest,
   transformAntigravityResponse,
 } from "./plugin/request";
+import {
+  isEmptyResponseBody,
+} from "./plugin/request-helpers";
+import { EmptyResponseError } from "./plugin/errors";
 import { AntigravityTokenRefreshError, refreshAccessToken } from "./plugin/token";
 import { startOAuthListener, type OAuthListener } from "./plugin/server";
 import { clearAccounts, loadAccounts, saveAccounts } from "./plugin/storage";
 import { AccountManager, type ModelFamily } from "./plugin/accounts";
 import { createAutoUpdateCheckerHook } from "./hooks/auto-update-checker";
+import { loadConfig, type AntigravityConfig } from "./plugin/config";
+import { createSessionRecoveryHook, getRecoverySuccessToast } from "./plugin/recovery";
+import { initDiskSignatureCache } from "./plugin/cache";
+import { createProactiveRefreshQueue, type ProactiveRefreshQueue } from "./plugin/refresh-queue";
+import { initLogger, createLogger } from "./plugin/logger";
 import type {
   GetAuth,
   LoaderResult,
@@ -38,21 +48,44 @@ import type {
 
 const MAX_OAUTH_ACCOUNTS = 10;
 const MAX_WARMUP_SESSIONS = 1000;
+const MAX_WARMUP_RETRIES = 2;
 const warmupAttemptedSessionIds = new Set<string>();
+const warmupSucceededSessionIds = new Set<string>();
 
-function trackWarmupSession(sessionId: string): boolean {
-  if (warmupAttemptedSessionIds.has(sessionId)) {
+const log = createLogger("plugin");
+
+function trackWarmupAttempt(sessionId: string): boolean {
+  if (warmupSucceededSessionIds.has(sessionId)) {
     return false;
   }
   if (warmupAttemptedSessionIds.size >= MAX_WARMUP_SESSIONS) {
     const first = warmupAttemptedSessionIds.values().next().value;
-    if (first) warmupAttemptedSessionIds.delete(first);
+    if (first) {
+      warmupAttemptedSessionIds.delete(first);
+      warmupSucceededSessionIds.delete(first);
+    }
+  }
+  const attempts = getWarmupAttemptCount(sessionId);
+  if (attempts >= MAX_WARMUP_RETRIES) {
+    return false;
   }
   warmupAttemptedSessionIds.add(sessionId);
   return true;
 }
 
-function untrackWarmupSession(sessionId: string): void {
+function getWarmupAttemptCount(sessionId: string): number {
+  return warmupAttemptedSessionIds.has(sessionId) ? 1 : 0;
+}
+
+function markWarmupSuccess(sessionId: string): void {
+  warmupSucceededSessionIds.add(sessionId);
+  if (warmupSucceededSessionIds.size >= MAX_WARMUP_SESSIONS) {
+    const first = warmupSucceededSessionIds.values().next().value;
+    if (first) warmupSucceededSessionIds.delete(first);
+  }
+}
+
+function clearWarmupAttempt(sessionId: string): void {
   warmupAttemptedSessionIds.delete(sessionId);
 }
 
@@ -233,9 +266,13 @@ async function persistAccountPool(
     : (typeof stored?.activeIndex === "number" && Number.isFinite(stored.activeIndex) ? stored.activeIndex : 0);
 
   await saveAccounts({
-    version: 2,
+    version: 3,
     accounts,
     activeIndex: clampInt(activeIndex, 0, accounts.length - 1),
+    activeIndexByFamily: {
+      claude: clampInt(activeIndex, 0, accounts.length - 1),
+      gemini: clampInt(activeIndex, 0, accounts.length - 1),
+    },
   });
 }
 
@@ -383,6 +420,9 @@ const SHORT_RETRY_THRESHOLD_MS = 5000;
 
 const rateLimitStateByAccount = new Map<number, { consecutive429: number; lastAt: number }>();
 
+// Track empty response retry attempts (ported from LLM-API-Key-Proxy)
+const emptyResponseAttempts = new Map<string, number>();
+
 function getRateLimitBackoff(accountIndex: number, serverRetryAfterMs: number | null): { attempt: number; delayMs: number } {
   const now = Date.now();
   const previous = rateLimitStateByAccount.get(accountIndex);
@@ -396,6 +436,33 @@ function getRateLimitBackoff(accountIndex: number, serverRetryAfterMs: number | 
 
 function resetRateLimitState(accountIndex: number): void {
   rateLimitStateByAccount.delete(accountIndex);
+}
+
+// Track consecutive non-429 failures per account to prevent infinite loops
+const accountFailureState = new Map<number, { consecutiveFailures: number; lastFailureAt: number }>();
+const MAX_CONSECUTIVE_FAILURES = 5;
+const FAILURE_COOLDOWN_MS = 30_000; // 30 seconds cooldown after max failures
+const FAILURE_STATE_RESET_MS = 120_000; // Reset failure count after 2 minutes of no failures
+
+function trackAccountFailure(accountIndex: number): { failures: number; shouldCooldown: boolean; cooldownMs: number } {
+  const now = Date.now();
+  const previous = accountFailureState.get(accountIndex);
+  
+  // Reset if last failure was more than 2 minutes ago
+  const failures = previous && (now - previous.lastFailureAt < FAILURE_STATE_RESET_MS) 
+    ? previous.consecutiveFailures + 1 
+    : 1;
+  
+  accountFailureState.set(accountIndex, { consecutiveFailures: failures, lastFailureAt: now });
+  
+  const shouldCooldown = failures >= MAX_CONSECUTIVE_FAILURES;
+  const cooldownMs = shouldCooldown ? FAILURE_COOLDOWN_MS : 0;
+  
+  return { failures, shouldCooldown, cooldownMs };
+}
+
+function resetAccountFailureState(accountIndex: number): void {
+  accountFailureState.delete(accountIndex);
 }
 
 /**
@@ -433,13 +500,78 @@ function sleep(ms: number, signal?: AbortSignal | null): Promise<void> {
 export const createAntigravityPlugin = (providerId: string) => async (
   { client, directory }: PluginContext,
 ): Promise<PluginResult> => {
+  // Load configuration from files and environment variables
+  const config = loadConfig(directory);
+  
+  // Initialize debug with config
+  initializeDebug(config);
+  
+  // Initialize structured logger for TUI integration
+  initLogger(client);
+  
+  // Initialize disk signature cache if keep_thinking is enabled
+  // This integrates with the in-memory cacheSignature/getCachedSignature functions
+  if (config.keep_thinking) {
+    initDiskSignatureCache(config.signature_cache);
+  }
+  
+  // Initialize session recovery hook with full context
+  const sessionRecovery = createSessionRecoveryHook({ client, directory }, config);
+  
   const updateChecker = createAutoUpdateCheckerHook(client, directory, {
     showStartupToast: true,
-    autoUpdate: true,
+    autoUpdate: config.auto_update,
   });
 
+  // Event handler for session recovery and updates
+  const eventHandler = async (input: { event: { type: string; properties?: unknown } }) => {
+    // Forward to update checker
+    await updateChecker.event(input);
+    
+    // Handle session recovery
+    if (sessionRecovery && input.event.type === "session.error") {
+      const props = input.event.properties as Record<string, unknown> | undefined;
+      const sessionID = props?.sessionID as string | undefined;
+      const messageID = props?.messageID as string | undefined;
+      const error = props?.error;
+      
+      if (sessionRecovery.isRecoverableError(error)) {
+        const messageInfo = {
+          id: messageID,
+          role: "assistant" as const,
+          sessionID,
+          error,
+        };
+        
+        // handleSessionRecovery now does the actual fix (injects tool_result, etc.)
+        const recovered = await sessionRecovery.handleSessionRecovery(messageInfo);
+
+        // Only send "continue" AFTER successful tool_result_missing recovery
+        // (thinking recoveries already resume inside handleSessionRecovery)
+        if (recovered && sessionID && config.auto_resume) {
+          // For tool_result_missing, we need to send continue after injecting tool_results
+          await client.session.prompt({
+            path: { id: sessionID },
+            body: { parts: [{ type: "text", text: config.resume_text }] },
+            query: { directory },
+          }).catch(() => {});
+          
+          // Show success toast
+          const successToast = getRecoverySuccessToast();
+          await client.tui.showToast({
+            body: {
+              title: successToast.title,
+              message: successToast.message,
+              variant: "success",
+            },
+          }).catch(() => {});
+        }
+      }
+    }
+  };
+
   return {
-    event: updateChecker.event,
+    event: eventHandler,
     auth: {
     provider: providerId,
     loader: async (getAuth: GetAuth, provider: Provider): Promise<LoaderResult | Record<string, unknown>> => {
@@ -468,9 +600,7 @@ export const createAntigravityPlugin = (providerId: string) => async (
         if (!hasMatchingAccount) {
           // OpenCode's auth doesn't match any stored account - storage is stale
           // Clear it and let the user re-authenticate
-          console.warn(
-            "[opencode-antigravity-auth] Stored accounts don't match OpenCode's auth. Clearing stale storage."
-          );
+          log.warn("Stored accounts don't match OpenCode's auth. Clearing stale storage.");
           try {
             await clearAccounts();
           } catch {
@@ -484,8 +614,20 @@ export const createAntigravityPlugin = (providerId: string) => async (
         try {
           await accountManager.saveToDisk();
         } catch (error) {
-          console.error("[opencode-antigravity-auth] Failed to persist initial account pool:", error);
+          log.error("Failed to persist initial account pool", { error: String(error) });
         }
+      }
+
+      // Initialize proactive token refresh queue (ported from LLM-API-Key-Proxy)
+      let refreshQueue: ProactiveRefreshQueue | null = null;
+      if (config.proactive_token_refresh && accountManager.getAccountCount() > 0) {
+        refreshQueue = createProactiveRefreshQueue(client, providerId, {
+          enabled: config.proactive_token_refresh,
+          bufferSeconds: config.proactive_refresh_buffer_seconds,
+          checkIntervalSeconds: config.proactive_refresh_check_interval_seconds,
+        });
+        refreshQueue.setAccountManager(accountManager);
+        refreshQueue.start();
       }
 
       if (isDebugEnabled()) {
@@ -577,7 +719,7 @@ export const createAntigravityPlugin = (providerId: string) => async (
 
           // Use while(true) loop to handle rate limits with backoff
           // This ensures we wait and retry when all accounts are rate-limited
-          const quietMode = process.env.OPENCODE_ANTIGRAVITY_QUIET === "1";
+          const quietMode = config.quiet_mode;
           
           while (true) {
             // Check for abort at the start of each iteration
@@ -592,11 +734,10 @@ export const createAntigravityPlugin = (providerId: string) => async (
             const account = accountManager.getCurrentOrNextForFamily(family);
             
             if (!account) {
-              // All accounts are rate-limited - wait and retry
+              // All accounts are rate-limited
               const waitMs = accountManager.getMinWaitTimeForFamily(family) || 60_000;
-              const waitSec = Math.max(1, Math.ceil(waitMs / 1000));
 
-              pushDebug(`all-rate-limited family=${family} accounts=${accountCount}`);
+              pushDebug(`all-rate-limited family=${family} accounts=${accountCount} waitMs=${waitMs}`);
               if (isDebugEnabled()) {
                 logAccountContext("All accounts rate-limited", {
                   index: -1,
@@ -606,9 +747,28 @@ export const createAntigravityPlugin = (providerId: string) => async (
                 logRateLimitSnapshot(family, accountManager.getAccountsSnapshot());
               }
 
+              // If wait time exceeds max threshold, return error immediately instead of hanging
+              // 0 means disabled (wait indefinitely)
+              const maxWaitMs = (config.max_rate_limit_wait_seconds ?? 300) * 1000;
+              if (maxWaitMs > 0 && waitMs > maxWaitMs) {
+                const waitTimeFormatted = formatWaitTime(waitMs);
+                await showToast(
+                  `Rate limited for ${waitTimeFormatted}. Try again later or add another account.`,
+                  "error"
+                );
+                
+                // Return a proper rate limit error response
+                throw new Error(
+                  `All ${accountCount} account(s) rate-limited for ${family}. ` +
+                  `Quota resets in ${waitTimeFormatted}. ` +
+                  `Add more accounts with \`opencode auth login\` or wait and retry.`
+                );
+              }
+
+              const waitSec = Math.max(1, Math.ceil(waitMs / 1000));
               await showToast(`All ${accountCount} account(s) rate-limited for ${family}. Waiting ${waitSec}s...`, "warning");
 
-              // Wait for the cooldown to expire
+              // Wait for the rate-limit cooldown to expire, then retry
               await sleep(waitMs, abortSignal);
               continue;
             }
@@ -639,7 +799,7 @@ export const createAntigravityPlugin = (providerId: string) => async (
             try {
               await accountManager.saveToDisk();
             } catch (error) {
-              console.error("[opencode-antigravity-auth] Failed to persist rotation state:", error);
+              log.error("Failed to persist rotation state", { error: String(error) });
             }
 
             let authRecord = accountManager.toAuthDetails(account);
@@ -648,30 +808,31 @@ export const createAntigravityPlugin = (providerId: string) => async (
               try {
                 const refreshed = await refreshAccessToken(authRecord, client, providerId);
                 if (!refreshed) {
+                  const { failures, shouldCooldown, cooldownMs } = trackAccountFailure(account.index);
                   lastError = new Error("Antigravity token refresh failed");
+                  if (shouldCooldown) {
+                    accountManager.markRateLimited(account, cooldownMs, family, "antigravity");
+                    pushDebug(`token-refresh-failed: cooldown ${cooldownMs}ms after ${failures} failures`);
+                  }
                   continue;
                 }
+                resetAccountFailureState(account.index);
                 accountManager.updateFromAuth(account, refreshed);
                 authRecord = refreshed;
                 try {
                   await accountManager.saveToDisk();
                 } catch (error) {
-                  console.error("[opencode-antigravity-auth] Failed to persist refreshed auth:", error);
+                  log.error("Failed to persist refreshed auth", { error: String(error) });
                 }
               } catch (error) {
                 if (error instanceof AntigravityTokenRefreshError && error.code === "invalid_grant") {
                   const removed = accountManager.removeAccount(account);
                   if (removed) {
-                    console.warn(
-                      "[opencode-antigravity-auth] Removed revoked account from pool. Reauthenticate it via `opencode auth login` to add it back.",
-                    );
+                    log.warn("Removed revoked account from pool - reauthenticate via `opencode auth login`");
                     try {
                       await accountManager.saveToDisk();
                     } catch (persistError) {
-                      console.error(
-                        "[opencode-antigravity-auth] Failed to persist revoked account removal:",
-                        persistError,
-                      );
+                      log.error("Failed to persist revoked account removal", { error: String(persistError) });
                     }
                   }
 
@@ -682,7 +843,7 @@ export const createAntigravityPlugin = (providerId: string) => async (
                         body: { type: "oauth", refresh: "", access: "", expires: 0 },
                       });
                     } catch (storeError) {
-                      console.error("Failed to clear stored Antigravity OAuth credentials:", storeError);
+                      log.error("Failed to clear stored Antigravity OAuth credentials", { error: String(storeError) });
                     }
 
                     throw new Error(
@@ -694,7 +855,12 @@ export const createAntigravityPlugin = (providerId: string) => async (
                   continue;
                 }
 
+                const { failures, shouldCooldown, cooldownMs } = trackAccountFailure(account.index);
                 lastError = error instanceof Error ? error : new Error(String(error));
+                if (shouldCooldown) {
+                  accountManager.markRateLimited(account, cooldownMs, family, "antigravity");
+                  pushDebug(`token-refresh-error: cooldown ${cooldownMs}ms after ${failures} failures`);
+                }
                 continue;
               }
             }
@@ -702,14 +868,23 @@ export const createAntigravityPlugin = (providerId: string) => async (
             const accessToken = authRecord.access;
             if (!accessToken) {
               lastError = new Error("Missing access token");
+              if (accountCount <= 1) {
+                throw lastError;
+              }
               continue;
             }
 
             let projectContext: ProjectContextResult;
             try {
               projectContext = await ensureProjectContext(authRecord);
+              resetAccountFailureState(account.index);
             } catch (error) {
+              const { failures, shouldCooldown, cooldownMs } = trackAccountFailure(account.index);
               lastError = error instanceof Error ? error : new Error(String(error));
+              if (shouldCooldown) {
+                accountManager.markRateLimited(account, cooldownMs, family, "antigravity");
+                pushDebug(`project-context-error: cooldown ${cooldownMs}ms after ${failures} failures`);
+              }
               continue;
             }
 
@@ -719,7 +894,7 @@ export const createAntigravityPlugin = (providerId: string) => async (
               try {
                 await accountManager.saveToDisk();
               } catch (error) {
-                console.error("[opencode-antigravity-auth] Failed to persist project context:", error);
+                log.error("Failed to persist project context", { error: String(error) });
               }
             }
 
@@ -731,7 +906,7 @@ export const createAntigravityPlugin = (providerId: string) => async (
                 return;
               }
 
-              if (!trackWarmupSession(prepared.sessionId)) {
+              if (!trackWarmupAttempt(prepared.sessionId)) {
                 return;
               }
 
@@ -778,17 +953,48 @@ export const createAntigravityPlugin = (providerId: string) => async (
                   prepared.sessionId,
                 );
                 await transformed.text();
+                markWarmupSuccess(prepared.sessionId);
                 pushDebug("thinking-warmup: done");
               } catch (error) {
-                untrackWarmupSession(prepared.sessionId);
+                clearWarmupAttempt(prepared.sessionId);
                 pushDebug(
                   `thinking-warmup: failed ${error instanceof Error ? error.message : String(error)}`,
                 );
               }
             };
 
-            // Try endpoint fallbacks
+            // Try endpoint fallbacks with header style fallback for Gemini
             let shouldSwitchAccount = false;
+            
+            // For Gemini models, we can try both header styles (antigravity first, then gemini-cli)
+            // For Claude models, only antigravity headers work
+            const headerStyles: HeaderStyle[] = family === "gemini" 
+              ? ["antigravity", "gemini-cli"] 
+              : ["antigravity"];
+            
+            let currentHeaderStyleIndex = 0;
+            
+            // Find first non-rate-limited header style for this account
+            while (currentHeaderStyleIndex < headerStyles.length) {
+              const hs = headerStyles[currentHeaderStyleIndex];
+              if (hs && !accountManager.isRateLimitedForHeaderStyle(account, family, hs)) {
+                break;
+              }
+              currentHeaderStyleIndex++;
+            }
+            
+            // If all header styles are rate-limited for this account, switch account
+            if (currentHeaderStyleIndex >= headerStyles.length) {
+              shouldSwitchAccount = true;
+            }
+            
+            headerStyleLoop:
+            while (!shouldSwitchAccount && currentHeaderStyleIndex < headerStyles.length) {
+              const currentHeaderStyle = headerStyles[currentHeaderStyleIndex]!;
+              pushDebug(`headerStyle=${currentHeaderStyle}`);
+            
+            // Flag to force thinking recovery on retry after API error
+            let forceThinkingRecovery = false;
             
             for (let i = 0; i < ANTIGRAVITY_ENDPOINT_FALLBACKS.length; i++) {
               const currentEndpoint = ANTIGRAVITY_ENDPOINT_FALLBACKS[i];
@@ -800,7 +1006,14 @@ export const createAntigravityPlugin = (providerId: string) => async (
                   accessToken,
                   projectContext.effectiveProjectId,
                   currentEndpoint,
+                  currentHeaderStyle,
+                  forceThinkingRecovery,
                 );
+
+                // Show thinking recovery toast (respects quiet mode)
+                if (!quietMode && prepared.thinkingRecoveryMessage) {
+                  await showToast(prepared.thinkingRecoveryMessage, "warning");
+                }
 
                 const originalUrl = toUrlString(input);
                 const resolvedUrl = toUrlString(prepared.request);
@@ -861,7 +1074,7 @@ export const createAntigravityPlugin = (providerId: string) => async (
                   await logResponseBody(debugContext, response, 429);
 
                   if (isCapacityExhausted) {
-                    accountManager.markRateLimited(account, delayMs, family);
+                    accountManager.markRateLimited(account, delayMs, family, currentHeaderStyle);
                     await showToast(
                       `Model capacity exhausted for ${family}. Retrying in ${waitTimeFormatted} (attempt ${attempt})...`,
                       "warning",
@@ -880,13 +1093,24 @@ export const createAntigravityPlugin = (providerId: string) => async (
                   }
 
 
-                  // Mark account as rate-limited for this family
-                  accountManager.markRateLimited(account, delayMs, family);
+                  // Mark this header style as rate-limited for this account
+                  accountManager.markRateLimited(account, delayMs, family, currentHeaderStyle);
 
                   try {
                     await accountManager.saveToDisk();
                   } catch (error) {
-                    console.error("[opencode-antigravity-auth] Failed to persist rate-limit state:", error);
+                    log.error("Failed to persist rate-limit state", { error: String(error) });
+                  }
+
+                  // For Gemini, try next header style before switching accounts
+                  if (family === "gemini" && currentHeaderStyleIndex < headerStyles.length - 1) {
+                    const nextHeaderStyle = headerStyles[currentHeaderStyleIndex + 1];
+                    await showToast(
+                      `Rate limited on ${currentHeaderStyle} quota. Trying ${nextHeaderStyle} quota...`,
+                      "warning",
+                    );
+                    currentHeaderStyleIndex++;
+                    continue headerStyleLoop;
                   }
 
                   if (accountCount > 1) {
@@ -938,6 +1162,7 @@ export const createAntigravityPlugin = (providerId: string) => async (
 
                 // Success - reset rate limit backoff state
                 resetRateLimitState(account.index);
+                resetAccountFailureState(account.index);
 
                 const shouldRetryEndpoint = (
                   response.status === 403 ||
@@ -973,6 +1198,49 @@ export const createAntigravityPlugin = (providerId: string) => async (
                 if (!response.ok) {
                   await logResponseBody(debugContext, response, response.status);
                 }
+                
+                // Empty response retry logic (ported from LLM-API-Key-Proxy)
+                // For non-streaming responses, check if the response body is empty
+                // and retry if so (up to config.empty_response_max_attempts times)
+                if (response.ok && !prepared.streaming) {
+                  const maxAttempts = config.empty_response_max_attempts ?? 4;
+                  const retryDelayMs = config.empty_response_retry_delay_ms ?? 2000;
+                  
+                  // Clone to check body without consuming original
+                  const clonedForCheck = response.clone();
+                  const bodyText = await clonedForCheck.text();
+                  
+                  if (isEmptyResponseBody(bodyText)) {
+                    // Track empty response attempts per request
+                    const emptyAttemptKey = `${prepared.sessionId ?? "none"}:${prepared.effectiveModel ?? "unknown"}`;
+                    const currentAttempts = (emptyResponseAttempts.get(emptyAttemptKey) ?? 0) + 1;
+                    emptyResponseAttempts.set(emptyAttemptKey, currentAttempts);
+                    
+                    pushDebug(`empty-response: attempt ${currentAttempts}/${maxAttempts}`);
+                    
+                    if (currentAttempts < maxAttempts) {
+                      await showToast(
+                        `Empty response received. Retrying (${currentAttempts}/${maxAttempts})...`,
+                        "warning"
+                      );
+                      await sleep(retryDelayMs, abortSignal);
+                      continue; // Retry the endpoint loop
+                    }
+                    
+                    // Clean up and throw after max attempts
+                    emptyResponseAttempts.delete(emptyAttemptKey);
+                    throw new EmptyResponseError(
+                      "antigravity",
+                      prepared.effectiveModel ?? "unknown",
+                      currentAttempts,
+                    );
+                  }
+                  
+                  // Clean up successful attempt tracking
+                  const emptyAttemptKeyClean = `${prepared.sessionId ?? "none"}:${prepared.effectiveModel ?? "unknown"}`;
+                  emptyResponseAttempts.delete(emptyAttemptKeyClean);
+                }
+                
                 return transformAntigravityResponse(
                   response,
                   prepared.streaming,
@@ -988,19 +1256,75 @@ export const createAntigravityPlugin = (providerId: string) => async (
                   debugLines,
                 );
               } catch (error) {
+                // Handle recoverable thinking errors - retry with forced recovery
+                if (error instanceof Error && error.message === "THINKING_RECOVERY_NEEDED") {
+                  // Only retry once with forced recovery to avoid infinite loops
+                  if (!forceThinkingRecovery) {
+                    pushDebug("thinking-recovery: API error detected, retrying with forced recovery");
+                    forceThinkingRecovery = true;
+                    i = -1; // Will become 0 after loop increment, restart endpoint loop
+                    continue;
+                  }
+                  
+                  // Already tried with forced recovery, give up and return error
+                  const recoveryError = error as any;
+                  const originalError = recoveryError.originalError || { error: { message: "Thinking recovery triggered" } };
+                  
+                  const recoveryMessage = `${originalError.error?.message || "Session recovery failed"}\n\n[RECOVERY] Thinking block corruption could not be resolved. Try starting a new session.`;
+                  
+                  return new Response(JSON.stringify({
+                    type: "error",
+                    error: {
+                      type: "unrecoverable_error",
+                      message: recoveryMessage
+                    }
+                  }), {
+                    status: 400,
+                    headers: { "Content-Type": "application/json" }
+                  });
+                }
+
                 if (i < ANTIGRAVITY_ENDPOINT_FALLBACKS.length - 1) {
                   lastError = error instanceof Error ? error : new Error(String(error));
                   continue;
                 }
 
-                // All endpoints failed for this account - try next account
+                // All endpoints failed for this account - track failure and try next account
+                const { failures, shouldCooldown, cooldownMs } = trackAccountFailure(account.index);
                 lastError = error instanceof Error ? error : new Error(String(error));
+                if (shouldCooldown) {
+                  accountManager.markRateLimited(account, cooldownMs, family, currentHeaderStyle);
+                  pushDebug(`endpoint-error: cooldown ${cooldownMs}ms after ${failures} failures`);
+                }
                 shouldSwitchAccount = true;
                 break;
               }
             }
+            } // end headerStyleLoop
             
             if (shouldSwitchAccount) {
+              // Avoid tight retry loops when there's only one account.
+              if (accountCount <= 1) {
+                if (lastFailure) {
+                  return transformAntigravityResponse(
+                    lastFailure.response,
+                    lastFailure.streaming,
+                    lastFailure.debugContext,
+                    lastFailure.requestedModel,
+                    lastFailure.projectId,
+                    lastFailure.endpoint,
+                    lastFailure.effectiveModel,
+                    lastFailure.sessionId,
+                    lastFailure.toolDebugMissing,
+                    lastFailure.toolDebugSummary,
+                    lastFailure.toolDebugPayload,
+                    debugLines,
+                  );
+                }
+
+                throw lastError || new Error("All Antigravity endpoints failed");
+              }
+
               continue;
             }
 

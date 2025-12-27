@@ -69,7 +69,61 @@ export const ANTIGRAVITY_HEADERS = {
   "Client-Metadata": '{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}',
 } as const;
 
+export const GEMINI_CLI_HEADERS = {
+  "User-Agent": "google-api-nodejs-client/9.15.1",
+  "X-Goog-Api-Client": "gl-node/22.17.0",
+  "Client-Metadata": "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
+} as const;
+
+export type HeaderStyle = "antigravity" | "gemini-cli";
+
 /**
  * Provider identifier shared between the plugin loader and credential store.
  */
 export const ANTIGRAVITY_PROVIDER_ID = "google";
+
+/**
+ * Whether to preserve thinking blocks for Claude models.
+ * 
+ * This value is now controlled via config (see plugin/config/schema.ts).
+ * The default is false for reliability. Set to true via:
+ * - Config file: { "keep_thinking": true }
+ * - Env var: OPENCODE_ANTIGRAVITY_KEEP_THINKING=1
+ * 
+ * @deprecated Use config.keep_thinking from loadConfig() instead.
+ *             This export is kept for backward compatibility but reads from env.
+ */
+export const KEEP_THINKING_BLOCKS =
+  process.env.OPENCODE_ANTIGRAVITY_KEEP_THINKING === "1" ||
+  process.env.OPENCODE_ANTIGRAVITY_KEEP_THINKING === "true";
+
+// ============================================================================
+// TOOL HALLUCINATION PREVENTION (Ported from LLM-API-Key-Proxy)
+// ============================================================================
+
+/**
+ * System instruction for Claude tool usage hardening.
+ * Prevents hallucinated parameters by explicitly stating the rules.
+ * 
+ * This is injected when tools are present to reduce cases where Claude
+ * uses parameter names from its training data instead of the actual schema.
+ */
+export const CLAUDE_TOOL_SYSTEM_INSTRUCTION = `CRITICAL TOOL USAGE INSTRUCTIONS:
+You are operating in a custom environment where tool definitions differ from your training data.
+You MUST follow these rules strictly:
+
+1. DO NOT use your internal training data to guess tool parameters
+2. ONLY use the exact parameter structure defined in the tool schema
+3. Parameter names in schemas are EXACT - do not substitute with similar names from your training
+4. Array parameters have specific item types - check the schema's 'items' field for the exact structure
+5. When you see "STRICT PARAMETERS" in a tool description, those type definitions override any assumptions
+6. Tool use in agentic workflows is REQUIRED - you must call tools with the exact parameters specified
+
+If you are unsure about a tool's parameters, YOU MUST read the schema definition carefully.`;
+
+/**
+ * Template for parameter signature injection into tool descriptions.
+ * {params} will be replaced with the actual parameter list.
+ */
+export const CLAUDE_DESCRIPTION_PROMPT = "\n\n⚠️ STRICT PARAMETERS: {params}.";
+
