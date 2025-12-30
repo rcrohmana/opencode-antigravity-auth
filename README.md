@@ -24,9 +24,7 @@ Add to your OpenCode config (`~/.config/opencode/opencode.json`):
 
 ```json
 {
-  "plugins": ["opencode-antigravity-auth@latest"],
-  "provider": "google",
-  "model": "google/antigravity-gemini-3-flash"
+  "plugin": ["opencode-antigravity-auth@beta"]
 }
 ```
 
@@ -99,7 +97,7 @@ Create `~/.config/opencode/opencode.json`
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    "opencode-antigravity-auth@latest"
+    "opencode-antigravity-auth@beta"
   ],
   "provider": {
     "google": {
@@ -348,8 +346,8 @@ If using `@tarquinen/opencode-dcp` (Dynamic Context Protocol), **our plugin must
 
 ```json
 {
-  "plugins": [
-    "opencode-antigravity-auth@latest",
+  "plugin": [
+    "opencode-antigravity-auth@beta",
     "@tarquinen/opencode-dcp@1.1.2"
   ]
 }
