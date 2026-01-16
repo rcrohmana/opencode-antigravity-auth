@@ -11,7 +11,6 @@ export type RateLimitReason =
   | "QUOTA_EXHAUSTED"
   | "RATE_LIMIT_EXCEEDED" 
   | "MODEL_CAPACITY_EXHAUSTED"
-  | "SERVICE_CAPACITY_EXHAUSTED"
   | "SERVER_ERROR"
   | "UNKNOWN";
 
@@ -23,12 +22,11 @@ export interface RateLimitBackoffResult {
 const QUOTA_EXHAUSTED_BACKOFFS = [60_000, 300_000, 1_800_000, 7_200_000] as const;
 const RATE_LIMIT_EXCEEDED_BACKOFF = 30_000;
 const MODEL_CAPACITY_EXHAUSTED_BACKOFF = 15_000;
-const SERVICE_CAPACITY_EXHAUSTED_BACKOFFS = [5000, 10000, 20000, 30000, 60000] as const;
 const SERVER_ERROR_BACKOFF = 20_000;
 const UNKNOWN_BACKOFF = 60_000;
 const MIN_BACKOFF_MS = 2_000;
 
-export function parseRateLimitReason(reason?: string, message?: string, quotaResetTime?: string | null): RateLimitReason {
+export function parseRateLimitReason(reason?: string, message?: string): RateLimitReason {
   if (reason) {
     switch (reason.toUpperCase()) {
       case "QUOTA_EXHAUSTED": return "QUOTA_EXHAUSTED";
@@ -41,12 +39,6 @@ export function parseRateLimitReason(reason?: string, message?: string, quotaRes
     const lower = message.toLowerCase();
     if (lower.includes("per minute") || lower.includes("rate limit") || lower.includes("too many requests")) {
       return "RATE_LIMIT_EXCEEDED";
-    }
-    if (lower.includes("resource has been exhausted") && !quotaResetTime) {
-      return "SERVICE_CAPACITY_EXHAUSTED";
-    }
-    if (lower.includes("no capacity")) {
-      return "MODEL_CAPACITY_EXHAUSTED";
     }
     if (lower.includes("exhausted") || lower.includes("quota")) {
       return "QUOTA_EXHAUSTED";
@@ -74,10 +66,6 @@ export function calculateBackoffMs(
       return RATE_LIMIT_EXCEEDED_BACKOFF;
     case "MODEL_CAPACITY_EXHAUSTED":
       return MODEL_CAPACITY_EXHAUSTED_BACKOFF;
-    case "SERVICE_CAPACITY_EXHAUSTED": {
-      const index = Math.min(consecutiveFailures, SERVICE_CAPACITY_EXHAUSTED_BACKOFFS.length - 1);
-      return SERVICE_CAPACITY_EXHAUSTED_BACKOFFS[index] ?? SERVICE_CAPACITY_EXHAUSTED_BACKOFFS[0];
-    }
     case "SERVER_ERROR":
       return SERVER_ERROR_BACKOFF;
     case "UNKNOWN":
