@@ -37,7 +37,7 @@ jobs:
           github.event.comment.author_association == 'COLLABORATOR'
         )
       )
-    timeout-minutes: 20
+    timeout-minutes: 30
     runs-on: 'ubuntu-latest'
 
     steps:
@@ -112,6 +112,7 @@ jobs:
           ## Capabilities & Constraints
           - ✅ **INVESTIGATE:** You CAN and SHOULD use tools (grep, read, ls) to explore the codebase, verify error messages, and check configurations.
           - ❌ **NO COMMITS:** You are running in a CI/CD triage environment. Do NOT attempt to push code, create PRs, or modify files permanently.
+          - ❌ **NO QUESTIONS:** Do NOT ask the user for more info. If information is missing, make your best guess or state what is missing in the `suggested_response`.
           - ✅ **REPORT:** If you identify a fix, describe it in detail in the `suggested_response` field so the developer can apply it.
           - 🏁 **MANDATORY:** Your FINAL action MUST be to output the JSON classification object. Do not exit without it.
 
@@ -213,8 +214,8 @@ jobs:
           echo "Session created: $SESSION_ID (name: $SESSION_NAME)"
           echo "session_id=$SESSION_ID" >> $GITHUB_OUTPUT
           
-          echo "Waiting for Jules to complete (max 15 minutes)..."
-          for i in {1..90}; do
+          echo "Waiting for Jules to complete (max 25 minutes)..."
+          for i in {1..150}; do
             sleep 10
             STATUS=$(curl -s "https://jules.googleapis.com/v1alpha/$SESSION_NAME" \
               -H "x-goog-api-key: $JULES_API_KEY")
