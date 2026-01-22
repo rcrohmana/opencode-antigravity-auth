@@ -1397,16 +1397,15 @@ export const createAntigravityPlugin = (providerId: string) => async (
                        capacityRetryCount++;
                        i -= 1;
                        continue; 
-                     } else {
-                       pushDebug(`Max capacity retries (3) exhausted for endpoint ${currentEndpoint}, regenerating fingerprint...`);
-                       // Regenerate fingerprint to get fresh device identity before trying next endpoint
-                       const newFingerprint = accountManager.regenerateAccountFingerprint(account.index);
-                       if (newFingerprint) {
-                         pushDebug(`Fingerprint regenerated for account ${account.index}`);
-                       }
-                       capacityRetryCount = 0; // Reset for next endpoint
-                       continue;
-                     }
+                      } else {
+                        pushDebug(`Max capacity retries (3) exhausted for endpoint ${currentEndpoint}, regenerating fingerprint...`);
+                        // Regenerate fingerprint to get fresh device identity before trying next endpoint
+                        const newFingerprint = accountManager.regenerateAccountFingerprint(account.index);
+                        if (newFingerprint) {
+                          pushDebug(`Fingerprint regenerated for account ${account.index}`);
+                        }
+                        continue;
+                      }
                   }
 
                   // STRATEGY 2: RATE LIMIT EXCEEDED (RPM) / QUOTA EXHAUSTED / UNKNOWN
